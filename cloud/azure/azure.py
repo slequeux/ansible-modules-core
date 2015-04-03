@@ -24,8 +24,13 @@ version_added: "1.7"
 options:
   name:
     description:
-      - name of the virtual machine and associated cloud service.
+      - name of the virtual machine.
     required: true
+    default: null
+  service_name:
+    description:
+      - name of the associated cloud service. Defaults to <name>.
+    required: false
     default: null
   location:
     description:
@@ -232,7 +237,8 @@ def create_virtual_machine(module, azure):
         True if a new virtual machine and/or cloud service was created, false otherwise
     """
     name = module.params.get('name')
-    hostname = module.params.get('hostname') or name + ".cloudapp.net"
+    service_name = module.params.get('service_name') or name
+    hostname = module.params.get('hostname') or service_name + ".cloudapp.net"
     endpoints = module.params.get('endpoints').split(',')
     ssh_cert_path = module.params.get('ssh_cert_path')
     user = module.params.get('user')
@@ -248,11 +254,11 @@ def create_virtual_machine(module, azure):
     changed = False
 
     # Check if a deployment with the same name already exists
-    cloud_service_name_available = azure.check_hosted_service_name_availability(name)
+    cloud_service_name_available = azure.check_hosted_service_name_availability(service_name)
     if cloud_service_name_available.result:
         # cloud service does not exist; create it
         try:
-            result = azure.create_hosted_service(service_name=name, label=name, location=location)
+            result = azure.create_hosted_service(service_name=service_name, label=service_name, location=location)
             _wait_for_completion(azure, result, wait_timeout, "create_hosted_service")
             changed = True
         except WindowsAzureError as e:
@@ -260,7 +266,7 @@ def create_virtual_machine(module, azure):
 
     try:
         # check to see if a vm with this name exists; if so, do nothing
-        azure.get_role(name, name, name)
+        azure.get_role(service_name, name, name)
     except WindowsAzureMissingResourceError:
         # vm does not exist; create it
 
@@ -295,31 +301,41 @@ def create_virtual_machine(module, azure):
 
         # First determine where to store disk
         today = datetime.date.today().strftime('%Y-%m-%d')
-        disk_prefix = u'%s-%s' % (name, name)
+        disk_prefix = u'%s-%s' % (service_name, name)
         media_link = u'http://%s.blob.core.windows.net/vhds/%s-%s.vhd' % (storage_account, disk_prefix, today)
         # Create system hard disk
         os_hd = OSVirtualHardDisk(image, media_link)
 
-        # Spin up virtual machine
         try:
-            result = azure.create_virtual_machine_deployment(service_name=name,
-                                                             deployment_name=name,
-                                                             deployment_slot='production',
-                                                             label=name,
-                                                             role_name=name,
-                                                             system_config=linux_config,
-                                                             network_config=network_config,
-                                                             os_virtual_hard_disk=os_hd,
-                                                             role_size=role_size,
-                                                             role_type='PersistentVMRole',
-                                                             virtual_network_name=virtual_network_name)
-            _wait_for_completion(azure, result, wait_timeout, "create_virtual_machine_deployment")
-            changed = True
+          if cloud_service_name_available.result:
+              # Creates the first VM in the service
+              result = azure.create_virtual_machine_deployment(service_name=service_name,
+                                                               deployment_name=service_name,
+                                                               deployment_slot='production',
+                                                               label=name,
+                                                               role_name=name,
+                                                               system_config=linux_config,
+                                                               network_config=network_config,
+                                                               os_virtual_hard_disk=os_hd,
+                                                               role_size=role_size,
+                                                               role_type='PersistentVMRole',
+                                                               virtual_network_name=virtual_network_name)
+              _wait_for_completion(azure, result, wait_timeout, "create_virtual_machine_deployment")
+          else:
+              # There already are some VM in the service.
+              result = azure.add_role(service_name=service_name,
+                                      deployment_name=service_name,
+                                      role_name=name,
+                                      system_config=linux_config,
+                                      network_config=network_config,
+                                      os_virtual_hard_disk=os_hd,
+                                      role_size=role_size)
+              _wait_for_completion(azure, result, wait_timeout, "add_role_to_deployment")
+          changed = True
         except WindowsAzureError as e:
             module.fail_json(msg="failed to create the new virtual machine, error was: %s" % str(e))
-
     try:
-        deployment = azure.get_deployment_by_name(service_name=name, deployment_name=name)
+        deployment = azure.get_deployment_by_name(service_name=service_name, deployment_name=service_name)
         return (changed, urlparse(deployment.url).hostname, deployment)
     except WindowsAzureError as e:
         module.fail_json(msg="failed to lookup the deployment information for %s, error was: %s" % (name, str(e)))
@@ -342,6 +358,7 @@ def terminate_virtual_machine(module, azure):
     wait = module.params.get('wait')
     wait_timeout = int(module.params.get('wait_timeout'))
     name = module.params.get('name')
+    service_name = module.params.get('service_name') or name
     delete_empty_services = module.params.get('delete_empty_services')
 
     changed = False
@@ -350,7 +367,7 @@ def terminate_virtual_machine(module, azure):
     public_dns_name = None
     disk_names = []
     try:
-        deployment = azure.get_deployment_by_name(service_name=name, deployment_name=name)
+        deployment = azure.get_deployment_by_name(service_name=service_name, deployment_name=name)
     except WindowsAzureMissingResourceError as e:
         pass  # no such deployment or service
     except WindowsAzureError as e:
@@ -363,18 +380,18 @@ def terminate_virtual_machine(module, azure):
             # gather disk info
             results = []
             for role in deployment.role_list:
-                role_props = azure.get_role(name, deployment.name, role.role_name)
+                role_props = azure.get_role(service_name, deployment.name, role.role_name)
                 if role_props.os_virtual_hard_disk.disk_name not in disk_names:
                     disk_names.append(role_props.os_virtual_hard_disk.disk_name)
 
-            result = azure.delete_deployment(name, deployment.name)
+            result = azure.delete_deployment(service_name, deployment.name)
             _wait_for_completion(azure, result, wait_timeout, "delete_deployment")
 
             for disk_name in disk_names:
                 azure.delete_disk(disk_name, True)
 
             # Now that the vm is deleted, remove the cloud service
-            result = azure.delete_hosted_service(service_name=name)
+            result = azure.delete_hosted_service(service_name=service_name)
             _wait_for_completion(azure, result, wait_timeout, "delete_hosted_service")
         except WindowsAzureError as e:
             module.fail_json(msg="failed to delete the service %s, error was: %s" % (name, str(e)))
@@ -405,6 +422,7 @@ def main():
         argument_spec=dict(
             ssh_cert_path=dict(),
             name=dict(),
+            service_name=dict(),
             hostname=dict(),
             location=dict(choices=AZURE_LOCATIONS),
             role_size=dict(choices=AZURE_ROLE_SIZES),
