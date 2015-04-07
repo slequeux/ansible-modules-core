@@ -63,7 +63,7 @@ options:
     default: Small
   endpoints:
     description:
-      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80"). If you want to change the public port, use a pipe-delimited pair in the format "public|local". For example if you want to expose ssh on port 88822, use: "88822|22,80".
+      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80"). If you want to change the public port, use a pipe-delimited pair in the format "public|local". For example if you want to expose ssh on port 88822, use: "88822|22,80". If you want to change to a load balanced port, use a pipe-delimited list in the format "name|public|local". For example, if you want to balance web server on port 80, use "WebServer|80|80". Load balanced port may not be unique within the service whereas non load balanced port must be.
     required: false
     default: 22
   user:
@@ -204,7 +204,7 @@ def _wait_for_completion(azure, promise, wait_timeout, msg):
         time.sleep(5)
         if operation_result.status == "Succeeded":
             return
-        elseif operation_result.status == "Failed":
+        elif operation_result.status == "Failed":
             raise WindowsAzureError('Error for async operation ' + msg)
 
     raise WindowsAzureError('Timed out waiting for async operation ' + msg + ' "' + str(promise.request_id) + '" to complete.')
@@ -297,15 +297,28 @@ def create_virtual_machine(module, azure):
         network_config.subnet_names = []
         for port_pair in endpoints:
             port_list = port_pair.split('|')
-            port = port_list[0]
-            try:
-                local_port = port_list[1]
-            except IndexError:
-                local_port = port_list[0]
-            network_config.input_endpoints.append(ConfigurationSetInputEndpoint(name='TCP-%s' % port,
-                                                                                protocol='TCP',
-                                                                                port=port,
-                                                                                local_port=local_port))
+            endpoint = ConfigurationSetInputEndpoint(name='TCP', 
+                                                     protocol='TCP',
+                                                     port=u'',
+                                                     local_port=u'')
+            if len(port_list) == 1:
+                endpoint.port = port_list[0]
+                endpoint.local_port = port_list[0]
+                endpoint.name = 'TCP-%s' % endpoint.port
+            elif len(port_list) == 2:
+                endpoint.port = port_list[0]
+                endpoint.local_port = port_list[1]
+                endpoint.name = 'TCP-%s' % endpoint.port
+            elif len(port_list) == 3:
+                endpoint.port = port_list[1]
+                endpoint.local_port = port_list[2]
+                endpoint.name = port_list[0]
+                endpoint.load_balanced_endpoint_set_name = port_list[0]
+                endpoint.load_balancer_probe.protocol = 'TCP'
+                endpoint.load_balancer_probe.port = port_list[2]
+            else:
+                module.fail_json(msg=port_pair + ' is not parsable.')
+            network_config.input_endpoints.append(endpoint)
 
         # First determine where to store disk
         today = datetime.date.today().strftime('%Y-%m-%d')
